@@ -10,7 +10,7 @@ export const DT = 0.02;
 export function validateNetwork(n: Network) {
     if (!n || !Array.isArray(n.ports) || !Array.isArray(n.tracks) || !Array.isArray(n.junctions)) throw Error('ネットワーク形式が不正です');
     const ports = new Set(n.ports.map(p => p.id));
-    if (ports.size !== n.ports.length || new Set(n.tracks.map(t => t.id)).size !== n.tracks.length) throw Error('IDが重複しています');
+    if (ports.size !== n.ports.length || new Set(n.tracks.map(t => t.id)).size !== n.tracks.length || new Set(n.junctions.map(j => j.id)).size !== n.junctions.length) throw Error('IDが重複しています');
     const used = new Set<string>();
     for (const t of n.tracks) {
         if (!Number.isFinite(t.length) || t.length <= 0 || !Number.isFinite(t.speedLimit) || t.speedLimit <= 0 || t.ports.length !== 2 || t.ports.some(p => !ports.has(p) || used.has(p)) || t.ports[0] === t.ports[1] || t.points.length < 2 || t.points.some(p => p.length !== 2 || p.some(v => !Number.isFinite(v)))) throw Error('線路の定義が不正です');
@@ -31,19 +31,59 @@ export function validateNetwork(n: Network) {
     }
 }
 function track(s: Simulation) { return s.network.tracks.find(t => t.id === s.train.trackId)!; }
-function next(s: Simulation): Position | undefined {
-    const t = track(s), exit = t.ports[s.train.direction === 1 ? 1 : 0];
+function next(s: Simulation, position: Position = s.train): Position | undefined {
+    const t = s.network.tracks.find(t => t.id === position.trackId)!, exit = t.ports[position.direction === 1 ? 1 : 0];
     const pair = s.network.junctions.flatMap(j => j.states[j.state]).find(p => p.includes(exit));
     if (!pair) return;
     const entry = pair[0] === exit ? pair[1] : pair[0];
     const dest = s.network.tracks.find(t => t.ports.includes(entry))!;
     return { trackId: dest.id, offset: dest.ports[0] === entry ? 0 : dest.length, direction: dest.ports[0] === entry ? 1 : -1 };
 }
+// Follow the selected connections, stopping before revisiting a directed track.
+export function selectedRoute(s: Simulation): Position[] {
+    const result: Position[] = [];
+    const seen = new Set<string>();
+    let position: Position | undefined = { trackId: s.train.trackId, offset: s.train.offset, direction: s.train.direction };
+    while (position && !seen.has(`${position.trackId}:${position.direction}`)) {
+        seen.add(`${position.trackId}:${position.direction}`);
+        result.push(position);
+        position = next(s, position);
+    }
+    return result;
+}
+export function junctionLocked(s: Simulation, junctionId: string): boolean {
+    const j = s.network.junctions.find(j => j.id === junctionId);
+    if (!j) throw Error('分岐器が見つかりません');
+    const ports = new Set(Object.values(j.states).flat(2));
+    // Protect 15 m on every leg, including the train's rear across track boundaries.
+    return occupied(s).some(seg => {
+        const t = s.network.tracks.find(t => t.id === seg.trackId)!;
+        return (ports.has(t.ports[0]) && Math.min(seg.from, seg.to) <= 15)
+            || (ports.has(t.ports[1]) && Math.max(seg.from, seg.to) >= t.length - 15);
+    });
+}
+export function setJunctionState(s: Simulation, junctionId: string, state: string) {
+    const j = s.network.junctions.find(j => j.id === junctionId);
+    if (!j || !Object.hasOwn(j.states, state)) throw Error('分岐器の状態が不正です');
+    if (j.state === state) return;
+    if (junctionLocked(s, junctionId)) throw Error('列車が分岐器付近を占有しています');
+    j.state = state;
+}
+function automaticTarget(s: Simulation): number {
+    let distance = 0, target = s.train.targetSpeed;
+    const route = selectedRoute(s);
+    for (const p of route) {
+        const t = s.network.tracks.find(t => t.id === p.trackId)!;
+        // Leave response margin for the proportional speed controller before a lower limit.
+        target = Math.min(target, distance === 0 ? t.speedLimit : Math.max(0, Math.sqrt(t.speedLimit ** 2 + 2 * 0.8 * distance) - 0.5));
+        distance += p.direction === 1 ? t.length - p.offset : p.offset;
+    }
+    if (!next(s, route.at(-1)!)) target = Math.min(target, Math.sqrt(2 * 0.8 * Math.max(0, distance - 1)));
+    return target;
+}
 export function step(s: Simulation) {
-    const tr = s.train, t = track(s), remaining = tr.direction === 1 ? t.length - tr.offset : tr.offset;
-    const end = !next(s);
-    // Automatic mode regulates speed and brakes for the buffer stop. Manual mode has a hard end boundary.
-    const target = Math.min(tr.targetSpeed, t.speedLimit, end ? Math.sqrt(2 * 0.8 * Math.max(0, remaining - 1)) : Infinity);
+    const tr = s.train, t = track(s);
+    const target = tr.mode === 'auto' ? automaticTarget(s) : 0;
     const acceleration = tr.mode === 'auto' ? Math.max(-1, Math.min(0.7, (target - tr.speed) * 2)) : tr.power * 0.7 - tr.brake * 1.2;
     const old = tr.speed;
     tr.speed = Math.max(0, Math.min(t.speedLimit, old + acceleration * DT));
