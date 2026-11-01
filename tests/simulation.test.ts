@@ -21,7 +21,7 @@ test('manual train cannot run beyond buffer stop',()=>{
     for(let i=0;i<100;i++)step(s);assert.equal(s.train.offset,600);assert.equal(s.train.speed,0);
 });
 test('entry through far port reverses local direction',()=>{
-    const n=structuredClone(demo);n.junctions[0].states['本線']=[['b','d']];n.junctions.splice(1);
+    const n=structuredClone(demo);n.junctions[0].states['本線']=[['b','d']];n.junctions.splice(1);n.routes=[];
     const s=createSimulation(n);s.train.offset=599.9;s.train.speed=10;step(s);
     assert.equal(s.train.trackId,'B');assert.equal(s.train.direction,-1);assert.ok(s.train.offset<800);
 });
